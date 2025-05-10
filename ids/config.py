@@ -1,37 +1,31 @@
-"""Centralised configuration using pydantic.BaseSettings."""
+# ids/config.py
 from pathlib import Path
-from typing import List
+from typing import List, Union
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class Config(BaseSettings):
-    """Global settings (overridable via env vars or .env file).
-    model_path can be passed to Trainer/CLI.
-    """
+    """Глобальные настройки проекта."""
 
-    # Dataset root containing *.csv generated from pcap
-    data_root: Path = Path("data")
-
-    # Default output directory for results / checkpoints
+    data_root:    Path = Path("data")
     results_root: Path = Path("results")
+    seed:           int = 42
 
-    # Random seed to make experiments reproducible
-    seed: int = 42
-
-    # Feature level: packet | uniflow | biflow
+    # packet | uniflow | biflow
     mode: str = "biflow"
 
-    # List of ML/DL models to train
+
     models: List[str] = ["lr", "rf", "mlp"]
 
-    # CV folds (0 = train‑test split)
-    cv_folds: int = 0
+    cv: Union[int, str] = 0
 
-    # DL hyper‑params
-    epochs: int = 20
-    batch_size: int = 64
+    # DL
+    epochs:      int = 20
+    batch_size:  int = 64
 
-    model_config = SettingsConfigDict(env_prefix="MQTTIDS_", env_file=".env")
+    model_config = SettingsConfigDict(
+        env_prefix="MQTTIDS_",
+        env_file=".env",
+        extra="ignore",        
+    )
 
-
-cfg = Config()  # singleton style
+cfg = Config()       

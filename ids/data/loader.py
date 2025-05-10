@@ -1,89 +1,88 @@
-"""Data loading utilities with optional grouping support.
-
-This loader supports both single CSV files and directories of CSVs.
-It concatenates all CSVs and returns features, labels, and flow groups:
-
-* If a file contains an `is_attack` column, that column is popped and used as `y`.
-* Otherwise labels are derived from the filename: `normal` → 0, else → 1.
-
-Grouping:
-* Computes `flow_id` by factorizing the tuple of (ip_src, ip_dst, prt_src, prt_dst).
-* Drops identifier columns afterwards to prevent leakage.
-
-Returns
--------
-X : pd.DataFrame
-    Concatenated features without identifier or `is_attack` columns.
-y : np.ndarray
-    1-D array of labels (0=benign,1=attack).
-groups : np.ndarray
-    1-D array of integer flow IDs for each record.
-"""
+# ids/data/loader.py
 from __future__ import annotations
-
-import re
+import re, numpy as np, pandas as pd
 from pathlib import Path
-from typing import Tuple, List, Union
-
-import pandas as pd
-import numpy as np
+from typing import Tuple, Union, List
 
 __all__ = ["load_dataset"]
 
-_ATTACK_RE = re.compile(r"attack|bruteforce|scan|sparta", re.I)
-_NORMAL_RE = re.compile(r"normal", re.I)
-
+_ATTACK_RE  = re.compile(r"attack|bruteforce|scan|sparta", re.I)
+_NORMAL_RE  = re.compile(r"normal", re.I)
 
 def _derive_label_from_name(name: str) -> int:
-    if _NORMAL_RE.search(name):
-        return 0
-    if _ATTACK_RE.search(name):
-        return 1
-    return 1
-
+    return 0 if _NORMAL_RE.search(name) else 1
 
 def _read_single_csv(path: Path) -> pd.DataFrame:
-    """Read one CSV into a DataFrame, retaining identifier columns and `is_attack` if present."""
-    df = pd.read_csv(path)
-    return df
+    return pd.read_csv(path, low_memory=False)
 
-
-def load_dataset(source: Union[str, Path]) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
-    """Load data and return (X, y, groups)."""
+def load_dataset(source: Union[str, Path], add_noise: float = 0.0, flip_prob: float = 0.10,
+) -> Tuple[pd.DataFrame,
+           np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns
+    -------
+    X                : DataFrame (без id‑колонок)
+    y                : ndarray  (0/1)
+    flow_groups      : ndarray  (id потока)
+    scenario_groups  : ndarray  (id файла‑сценария)
+    attack_groups    : ndarray  (scenario_id для attack, −1 для benign)
+    """
     source = Path(source)
-    # Collect CSV files
-    if source.is_file():
-        paths = [source]
-    elif source.is_dir():
-        paths = sorted(source.glob("*.csv"))
-    else:
-        raise FileNotFoundError(f"Source {source} is not a file or directory")
-
+    paths  = [source] if source.is_file() else sorted(source.glob("*.csv"))
     if not paths:
-        raise ValueError(f"No CSV files found in {source}")
+        raise FileNotFoundError(f"No CSV files in {source}")
 
-    df_list: List[pd.DataFrame] = []
-    y_list: List[np.ndarray] = []
-    scenario_list: List[np.ndarray] = []
-    for idx, path in enumerate(paths):
-        df = _read_single_csv(path)
-        # Extract labels
-        if 'is_attack' in df.columns:
-            y = df.pop('is_attack').astype(int).values
+    df_list, y_list, scen_list = [], [], []
+
+    for idx, p in enumerate(paths):
+        df = _read_single_csv(p)
+
+        if "is_attack" in df.columns:
+            y_raw = pd.to_numeric(df.pop("is_attack"), errors="coerce")
+            mask  = y_raw.notna()
+            y     = y_raw[mask].astype(int).values
+            df    = df[mask].reset_index(drop=True)
         else:
-            y = np.full(len(df), _derive_label_from_name(path.stem), dtype=int)
+            y = np.full(len(df), _derive_label_from_name(p.stem), dtype=int)
+
         df_list.append(df)
         y_list.append(y)
-        # Scenario grouping: each file gets a unique group id
-        scenario_list.append(np.full(len(df), idx, dtype=int))
+        scen_list.append(np.full(len(df), idx, dtype=int))
 
-    # Concatenate all frames and labels
-    df_all = pd.concat(df_list, ignore_index=True)
-    y_all = np.concatenate(y_list, axis=0)
-    groups = np.concatenate(scenario_list, axis=0)
+    df_all           = pd.concat(df_list, ignore_index=True)
+    y_all            = np.concatenate(y_list,   axis=0)
+    scenario_groups  = np.concatenate(scen_list, axis=0)
 
-    # Drop identifier columns to prevent leakage
-    id_cols = ['ip_src', 'ip_dst', 'prt_src', 'prt_dst']
-    X = df_all.drop(columns=id_cols, errors='ignore')
+    flow_cols = ["ip_src", "ip_dst", "prt_src", "prt_dst"]
+    tuples    = pd.Series(list(zip(*(df_all[c] for c in flow_cols))))
+    df_all["flow_id"] = tuples.factorize()[0]
+    flow_groups = df_all["flow_id"].to_numpy()
+    attack_groups = np.where(y_all == 1, scenario_groups, -1)
 
-    return X, y_all, groups
+    X = df_all.drop(columns=flow_cols + ["flow_id"], errors="ignore")
+
+    # 1) Label‑noise  ─────────────────────────────────────────
+    if flip_prob > 0:
+        flip = np.random.rand(len(y_all)) < flip_prob
+
+        y_all[flip] = 1 - y_all[flip]
+    # 2) Numeric noise  σ = add_noise · std(col) ─────────────
+    if add_noise > 0:
+        for c in X.columns:
+            if pd.api.types.is_numeric_dtype(X[c]):
+                v      = pd.to_numeric(X[c], errors="coerce")
+                std    = v.std(ddof=0)
+                noise  = np.random.normal(0, add_noise * std, size=len(v))
+                v      = v.add(noise, fill_value=np.nan)
+                X[c]   = v
+
+    # 3) Drop «strong» features  (регулярку можно расширить) ─
+    DROP = [col for col in X.columns if
+            col.endswith("_sum") or col.endswith("_bytes")]
+    X.drop(columns=DROP, errors="ignore", inplace=True)
+
+    # 4) Огрубляем значения  → целые (исчезают «мелкие» различия)
+    num_cols = X.select_dtypes("number").columns
+    X[num_cols] = X[num_cols].round(0)
+
+    return X, y_all, flow_groups, scenario_groups, attack_groups

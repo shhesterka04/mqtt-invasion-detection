@@ -1,83 +1,64 @@
-"""CLI entry‑point compatible with original script.
-Now supports `--data DIR` so you may pass a directory containing many
-CSV‑files (e.g. `biflow_normal.csv`, `biflow_scan_A.csv`, …). The loader
-concatenates them automatically.
-
-Example
--------
-    python3.10 classification.py \
-        --data biflow_features \
-        --mode 2 \
-        --models lr rf mlp \
-        --cv 3 --epochs 15 --verbose 1 --output results
-
-Note: *не пишите комментарий после обратного слеша* – иначе zsh посчитает
-строку новой командой.
-"""
+#!/usr/bin/env python3
+# ids/cli/classification.py
 from __future__ import annotations
-
 import argparse
 from pathlib import Path
-from typing import List
+from typing import Sequence
 
-from ids.config import Config
-from ids.data.loader import load_dataset
-from ids.train import Trainer
-
+from ids.config          import Config
+from ids.data.loader     import load_dataset
+from ids.train           import Trainer
+from ids.models.classical import get_classical_models
 
 MODE_MAP = {0: "packet", 1: "uniflow", 2: "biflow"}
 
+DL_MODEL_KEYS = ["mlp_dl", "cnn_1d", "bilstm"]   
+ALL_MODELS = set(get_classical_models().keys()) | set(DL_MODEL_KEYS)
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default="data", help="CSV file or directory with many CSVs")
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        prog="classification",
+        description="Training / evaluation for MQTT‑IDS",
+    )
+    ap.add_argument("--data", default="data",
+        help="CSV‑файл или директория с CSV‑файлами")
     ap.add_argument("--mode", type=int, choices=[0, 1, 2], default=2,
-                    help="0 packet, 1 uniflow, 2 biflow")
-    ap.add_argument("--models", nargs="*", default=["lr"], help="lr rf knn svm mlp …")
-    ap.add_argument("--cv", type=int, default=0, help="k‑folds (0 = simple split)")
+        help="0 packet, 1 uniflow, 2 biflow")
+    ap.add_argument("--models", nargs="+", default=["lr"],
+        help=f"модели: {', '.join(sorted(ALL_MODELS))}")
+    ap.add_argument("--cv", default="0",
+        help="k (целое) для StratifiedGroupKFold или 'loso'")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--output", default="results")
-    ap.add_argument("--verbose", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
-    args = ap.parse_args()
+    ap.add_argument("--verbose", type=int, default=1)
+    return ap.parse_args(argv)
 
-    # 1) load data (directory or single CSV)
-    X, y, groups = load_dataset(Path(args.data))
+def main() -> None:
+    args = parse_args()
 
-    # 2) build runtime config for Trainer
+    bad = [m for m in args.models if m not in ALL_MODELS]
+    if bad:
+        raise ValueError(f"Неизвестные модели: {', '.join(bad)}")
+
+    X, y, flow_g, scen_g, atk_g = load_dataset(Path(args.data), add_noise=0.1)
+
     conf = Config(
-        data_root=Path(args.data),
-        results_root=Path(args.output),
-        mode=MODE_MAP[args.mode],
-        models=args.models,
-        cv_folds=args.cv,
-        epochs=args.epochs,
-        seed=args.seed,
+        data_root   = Path(args.data),
+        results_root= Path(args.output),
+        mode        = MODE_MAP[args.mode],
+        models      = args.models,
+        cv          = args.cv if args.cv == "loso" else int(args.cv),
+        epochs      = args.epochs,
+        seed        = args.seed,
     )
 
-    # 3) train & evaluate
-    trainer = Trainer(conf=conf)
-    trainer.run(X, y, groups)
+    Trainer(conf).run(X, y, flow_groups=flow_g, attack_groups=atk_g)
 
-    # Debug: list result files and print first lines of each
-    print("[DEBUG] Listing all files in results directory:")
-    results_path = Path(args.output)
-    if results_path.exists():
-        for path in sorted(results_path.rglob('*')):
-            if path.is_file():
-                rel = path.relative_to(results_path)
-                print(f"--- {rel} ---")
-                try:
-                    lines = path.read_text().splitlines()
-                    for ln in lines[:5]:
-                        print(ln)
-                    if len(lines) > 5:
-                        print("...")
-                except Exception as e:
-                    print(f"[ERROR] Cannot read {rel}: {e}")
-    else:
-        print(f"[DEBUG] No results directory found at {results_path}")
-
+    print("\n[DEBUG] Files in", conf.results_root)
+    for p in sorted(conf.results_root.rglob("*")):
+        if p.is_file():
+            print("  └─", p.relative_to(conf.results_root))
 
 if __name__ == "__main__":
     main()
